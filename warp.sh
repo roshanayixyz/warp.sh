@@ -29,6 +29,7 @@
 #
 
 shVersion='1.0.40_Final'
+SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || printf '%s' "$0")"
 
 FontColor_Red="\033[31m"
 FontColor_Red_Bold="\033[1;31m"
@@ -58,7 +59,11 @@ log() {
         ;;
     *) ;;
     esac
-    echo -e "${MSG}"
+    local TIMESTAMP=""
+    if [[ ${LOG_WITH_TIMESTAMP} = 1 ]]; then
+        TIMESTAMP="[$(date '+%Y-%m-%d %H:%M:%S')] "
+    fi
+    echo -e "${TIMESTAMP}${MSG}"
 }
 
 if [[ $(uname -s) != Linux ]]; then
@@ -105,6 +110,28 @@ TestIPv4_2='9.9.9.9'
 TestIPv6_1='2606:4700:4700::1001'
 TestIPv6_2='2620:fe::fe'
 CF_Trace_URL='https://www.cloudflare.com/cdn-cgi/trace'
+Network_Status_Cache_TTL=5
+Network_Status_Last_Check=0
+ENABLE_NETCACHE=${ENABLE_NETCACHE:-0}
+ENABLE_FAST_MTU=${ENABLE_FAST_MTU:-0}
+ENABLE_FAST_ENDPOINT=${ENABLE_FAST_ENDPOINT:-0}
+AUTO_HEAL_ENABLED=${AUTO_HEAL_ENABLED:-1}
+AUTO_HEAL_HANDSHAKE_TIMEOUT=${AUTO_HEAL_HANDSHAKE_TIMEOUT:-300}
+AUTO_HEAL_ROUTE_TARGET=${AUTO_HEAL_ROUTE_TARGET:-1.1.1.1}
+AUTO_HEAL_COOLDOWN=${AUTO_HEAL_COOLDOWN:-60}
+AUTO_HEAL_TIMER_INTERVAL=${AUTO_HEAL_TIMER_INTERVAL:-15min}
+AUTO_HEAL_SERVICE_NAME='warp-autoheal.service'
+AUTO_HEAL_TIMER_NAME='warp-autoheal.timer'
+AUTO_HEAL_ENV_FILE='/etc/default/warp-autoheal'
+AUTO_HEAL_SERVICE_PATH="/etc/systemd/system/${AUTO_HEAL_SERVICE_NAME}"
+AUTO_HEAL_TIMER_PATH="/etc/systemd/system/${AUTO_HEAL_TIMER_NAME}"
+AutoHeal_Last_Run=0
+AutoHeal_Last_Action='never'
+LOG_WITH_TIMESTAMP=${LOG_WITH_TIMESTAMP:-1}
+LastKnown_MTU=""
+LastKnown_Peer_Endpoint=""
+LastKnown_RouteSnapshot=""
+WireGuard_Handshake_Age=0
 
 Get_System_Info() {
     source /etc/os-release
@@ -153,7 +180,7 @@ Install_Requirements_Debian() {
 Install_WARP_Client_Debian() {
     if [[ ${SysInfo_OS_Name_lowercase} = ubuntu ]]; then
         case ${SysInfo_OS_CodeName} in
-        bionic | focal | jammy) ;;
+        bionic | focal | jammy | noble) ;;
         *)
             log ERROR "This operating system is not supported."
             exit 1
@@ -316,7 +343,7 @@ Register_WARP_Account() {
         Install_wgcf
         log INFO "Cloudflare WARP Account registration in progress..."
         yes | wgcf register
-        sleep 5
+        sleep 1
     done
 }
 
@@ -575,22 +602,49 @@ Check_Network_Status_IPv6() {
 }
 
 Check_Network_Status() {
-    Disable_WireGuard
-    Check_Network_Status_IPv4
-    Check_Network_Status_IPv6
+    if [[ ${ENABLE_NETCACHE} = 1 ]]; then
+        local now
+        now=$(date +%s)
+        if [[ ${Network_Status_Last_Check} -ne 0 && $((now - Network_Status_Last_Check)) -lt ${Network_Status_Cache_TTL} ]]; then
+            return
+        fi
+        Network_Status_Last_Check=${now}
+        Check_Network_Status_IPv4
+        Check_Network_Status_IPv6
+    else
+        Disable_WireGuard
+        Check_Network_Status_IPv4
+        Check_Network_Status_IPv6
+    fi
 }
 
 Check_IPv4_addr() {
     IPv4_addr=$(
-        ip route get ${TestIPv4_1} 2>/dev/null | grep -oP 'src \K\S+' ||
-            ip route get ${TestIPv4_2} 2>/dev/null | grep -oP 'src \K\S+'
+        ip -o -4 addr show scope global up 2>/dev/null | awk -v iface="${WireGuard_Interface}" '$2 != iface {split($4, a, "/"); print a[1]; exit}'
     )
+    if [[ -z ${IPv4_addr} ]]; then
+        IPv4_addr=$(
+            ip -4 route get ${TestIPv4_1} table main 2>/dev/null | grep -oP 'src \K\S+' ||
+                ip -4 route get ${TestIPv4_2} table main 2>/dev/null | grep -oP 'src \K\S+'
+        )
+    fi
 }
 
 Check_IPv6_addr() {
     IPv6_addr=$(
-        ip route get ${TestIPv6_1} 2>/dev/null | grep -oP 'src \K\S+' ||
-            ip route get ${TestIPv6_2} 2>/dev/null | grep -oP 'src \K\S+'
+        ip -o -6 addr show scope global up 2>/dev/null | awk -v iface="${WireGuard_Interface}" '$2 != iface {split($4, a, "/"); print a[1]; exit}'
+    )
+    if [[ -z ${IPv6_addr} ]]; then
+        IPv6_addr=$(
+            ip -6 route get ${TestIPv6_1} table main 2>/dev/null | grep -oP 'src \K\S+' ||
+                ip -6 route get ${TestIPv6_2} table main 2>/dev/null | grep -oP 'src \K\S+'
+        )
+    fi
+}
+
+Capture_Route_Snapshot() {
+    LastKnown_RouteSnapshot=$(
+        ip -4 route show table main 2>/dev/null | head -n 5
     )
 }
 
@@ -601,6 +655,7 @@ Get_IP_addr() {
         Check_IPv4_addr
         if [[ ${IPv4_addr} ]]; then
             log INFO "IPv4 Address: ${IPv4_addr}"
+            Capture_Route_Snapshot
         else
             log WARN "Network interface IPv4 address not obtained."
         fi
@@ -618,8 +673,7 @@ Get_IP_addr() {
 
 Get_WireGuard_Interface_MTU() {
     log INFO "Getting the best MTU value for WireGuard..."
-    MTU_Preset=1500
-    MTU_Increment=10
+    local CMD_ping MTU_TestIP_1 MTU_TestIP_2
     if [[ ${IPv4Status} = off && ${IPv6Status} = on ]]; then
         CMD_ping='ping6'
         MTU_TestIP_1="${TestIPv6_1}"
@@ -629,24 +683,51 @@ Get_WireGuard_Interface_MTU() {
         MTU_TestIP_1="${TestIPv4_1}"
         MTU_TestIP_2="${TestIPv4_2}"
     fi
-    while true; do
-        if ${CMD_ping} -c1 -W1 -s$((${MTU_Preset} - 28)) -Mdo ${MTU_TestIP_1} >/dev/null 2>&1 || ${CMD_ping} -c1 -W1 -s$((${MTU_Preset} - 28)) -Mdo ${MTU_TestIP_2} >/dev/null 2>&1; then
-            MTU_Increment=1
-            MTU_Preset=$((${MTU_Preset} + ${MTU_Increment}))
+    if [[ ${ENABLE_FAST_MTU} = 1 ]]; then
+        local lower=1360
+        local upper=1500
+        local best=0
+        local attempts=0
+        while [[ ${lower} -le ${upper} && ${attempts} -lt 12 ]]; do
+            local guess=$(((lower + upper) / 2))
+            if ${CMD_ping} -c1 -W1 -s$((${guess} - 28)) -Mdo ${MTU_TestIP_1} >/dev/null 2>&1 || \
+                ${CMD_ping} -c1 -W1 -s$((${guess} - 28)) -Mdo ${MTU_TestIP_2} >/dev/null 2>&1; then
+                best=${guess}
+                lower=$((guess + 1))
+            else
+                upper=$((guess - 1))
+            fi
+            attempts=$((attempts + 1))
+        done
+        if [[ ${best} -gt 0 ]]; then
+            WireGuard_Interface_MTU=$((best - 80))
+            log INFO "WireGuard MTU: ${WireGuard_Interface_MTU}"
         else
-            MTU_Preset=$((${MTU_Preset} - ${MTU_Increment}))
-            if [[ ${MTU_Increment} = 1 ]]; then
+            log WARN "Unable to probe MTU, falling back to default ${WireGuard_Interface_MTU}."
+        fi
+    else
+        MTU_Preset=1500
+        MTU_Increment=10
+        while true; do
+            if ${CMD_ping} -c1 -W1 -s$((${MTU_Preset} - 28)) -Mdo ${MTU_TestIP_1} >/dev/null 2>&1 || ${CMD_ping} -c1 -W1 -s$((${MTU_Preset} - 28)) -Mdo ${MTU_TestIP_2} >/dev/null 2>&1; then
+                MTU_Increment=1
+                MTU_Preset=$((${MTU_Preset} + ${MTU_Increment}))
+            else
+                MTU_Preset=$((${MTU_Preset} - ${MTU_Increment}))
+                if [[ ${MTU_Increment} = 1 ]]; then
+                    break
+                fi
+            fi
+            if [[ ${MTU_Preset} -le 1360 ]]; then
+                log WARN "MTU is set to the lowest value."
+                MTU_Preset='1360'
                 break
             fi
-        fi
-        if [[ ${MTU_Preset} -le 1360 ]]; then
-            log WARN "MTU is set to the lowest value."
-            MTU_Preset='1360'
-            break
-        fi
-    done
-    WireGuard_Interface_MTU=$((${MTU_Preset} - 80))
-    log INFO "WireGuard MTU: ${WireGuard_Interface_MTU}"
+        done
+        WireGuard_Interface_MTU=$((${MTU_Preset} - 80))
+        log INFO "WireGuard MTU: ${WireGuard_Interface_MTU}"
+    fi
+    LastKnown_MTU="${WireGuard_Interface_MTU}"
 }
 
 Generate_WireGuardProfile_Interface() {
@@ -844,16 +925,134 @@ Check_WARP_WireGuard_Status() {
     fi
 }
 
+Check_WireGuard_Health() {
+    local handshake_ts
+    handshake_ts=$(wg show ${WireGuard_Interface} latest-handshakes 2>/dev/null | awk 'NR==1 {print $2}')
+    if [[ ${handshake_ts} =~ ^[0-9]+$ && ${handshake_ts} -gt 0 ]]; then
+        local now
+        now=$(date +%s)
+        WireGuard_Handshake_Age=$((now - handshake_ts))
+    else
+        WireGuard_Handshake_Age=0
+    fi
+}
+
+Auto_Heal_WireGuard() {
+    if [[ ${AUTO_HEAL_ENABLED} != 1 ]]; then
+        return
+    fi
+    local now
+    now=$(date +%s)
+    if [[ ${AutoHeal_Last_Run} -ne 0 && $((now - AutoHeal_Last_Run)) -lt ${AUTO_HEAL_COOLDOWN} ]]; then
+        return
+    fi
+    AutoHeal_Last_Run=${now}
+    Check_WireGuard
+    if [[ ${WireGuard_Status} != active ]]; then
+        return
+    fi
+    Check_WireGuard_Health
+    local needs_heal=0
+    if [[ ${WireGuard_Handshake_Age} -ge ${AUTO_HEAL_HANDSHAKE_TIMEOUT} && ${WireGuard_Handshake_Age} -ne 0 ]]; then
+        log WARN "WireGuard handshake stale (${WireGuard_Handshake_Age}s); attempting auto-heal."
+        needs_heal=1
+    fi
+    if [[ ${needs_heal} = 0 ]]; then
+        if ! ping -c1 -W1 ${AUTO_HEAL_ROUTE_TARGET} >/dev/null 2>&1; then
+            log WARN "Connectivity check to ${AUTO_HEAL_ROUTE_TARGET} failed; attempting auto-heal."
+            needs_heal=1
+        fi
+    fi
+    if [[ ${needs_heal} = 1 ]]; then
+        Restart_WireGuard
+        AutoHeal_Last_Action="Restarted WireGuard at $(date '+%Y-%m-%d %H:%M:%S')"
+    else
+        AutoHeal_Last_Action="Checked at $(date '+%Y-%m-%d %H:%M:%S') (healthy)"
+    fi
+}
+
+AutoHeal_Task() {
+    log INFO "Auto-heal task triggered."
+    Get_System_Info
+    Check_WireGuard_Status
+    Check_WARP_WireGuard_Status
+    Check_WireGuard_Health
+    Auto_Heal_WireGuard
+    log INFO "Auto-heal task completed."
+}
+
+Install_AutoHeal_Service() {
+    if [[ -z $(command -v systemctl) ]]; then
+        log ERROR "systemd is required to install the auto-heal service."
+        exit 1
+    fi
+    if [[ ! -f ${SCRIPT_PATH} ]]; then
+        log ERROR "Script path (${SCRIPT_PATH}) not found. Please run this script from a local file."
+        exit 1
+    fi
+    cat <<EOF >${AUTO_HEAL_ENV_FILE}
+WARP_SCRIPT_PATH="${SCRIPT_PATH}"
+LOG_WITH_TIMESTAMP=${LOG_WITH_TIMESTAMP}
+ENABLE_NETCACHE=${ENABLE_NETCACHE}
+ENABLE_FAST_MTU=${ENABLE_FAST_MTU}
+ENABLE_FAST_ENDPOINT=${ENABLE_FAST_ENDPOINT}
+AUTO_HEAL_ENABLED=${AUTO_HEAL_ENABLED}
+AUTO_HEAL_HANDSHAKE_TIMEOUT=${AUTO_HEAL_HANDSHAKE_TIMEOUT}
+AUTO_HEAL_ROUTE_TARGET=${AUTO_HEAL_ROUTE_TARGET}
+AUTO_HEAL_COOLDOWN=${AUTO_HEAL_COOLDOWN}
+EOF
+    cat <<EOF >${AUTO_HEAL_SERVICE_PATH}
+[Unit]
+Description=Cloudflare WARP auto-heal task
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-${AUTO_HEAL_ENV_FILE}
+ExecStart=/bin/bash -c "\$WARP_SCRIPT_PATH autoheal-task"
+Nice=10
+EOF
+    cat <<EOF >${AUTO_HEAL_TIMER_PATH}
+[Unit]
+Description=Run Cloudflare WARP auto-heal periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${AUTO_HEAL_TIMER_INTERVAL}
+AccuracySec=1min
+Unit=${AUTO_HEAL_SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now ${AUTO_HEAL_TIMER_NAME}
+    log INFO "Auto-heal systemd timer enabled (${AUTO_HEAL_TIMER_INTERVAL} interval)."
+}
+
+Uninstall_AutoHeal_Service() {
+    if [[ -z $(command -v systemctl) ]]; then
+        log ERROR "systemd is required to manage the auto-heal service."
+        exit 1
+    fi
+    systemctl disable --now ${AUTO_HEAL_TIMER_NAME} 2>/dev/null || true
+    rm -f ${AUTO_HEAL_SERVICE_PATH} ${AUTO_HEAL_TIMER_PATH}
+    systemctl daemon-reload
+    log INFO "Auto-heal systemd timer removed."
+}
+
 Check_ALL_Status() {
     Check_WARP_Client_Status
     Check_WARP_Proxy_Status
     Check_WireGuard_Status
     Check_WARP_WireGuard_Status
+    Check_WireGuard_Health
+    Auto_Heal_WireGuard
 }
 
 Print_WARP_Client_Status() {
     log INFO "Status check in progress..."
-    sleep 3
     Check_WARP_Client_Status
     Check_WARP_Proxy_Status
     echo -e "
@@ -874,8 +1073,19 @@ Print_WARP_WireGuard_Status() {
  WireGuard\t: ${WireGuard_Status_en}
  IPv4 Network\t: ${WARP_IPv4_Status_en}
  IPv6 Network\t: ${WARP_IPv6_Status_en}
+ Last Handshake\t: $( [[ ${WireGuard_Handshake_Age} -gt 0 ]] && echo "${WireGuard_Handshake_Age}s ago" || echo "Unavailable" )
+ Endpoint\t: ${LastKnown_Peer_Endpoint:-Unknown}
+ MTU\t\t: ${LastKnown_MTU:-${WireGuard_Interface_MTU}}
+ Auto-Heal\t: $( [[ ${AUTO_HEAL_ENABLED} = 1 ]] && echo "Enabled (cooldown ${AUTO_HEAL_COOLDOWN}s)" || echo "Disabled" )
  ----------------------------
 "
+    if [[ -n ${LastKnown_RouteSnapshot} ]]; then
+        echo -e " Route snapshot (top 5):"
+        printf '%s\n' "${LastKnown_RouteSnapshot}" | sed 's/^/   /'
+    fi
+    if [[ ${AutoHeal_Last_Action} != 'never' ]]; then
+        echo -e " Last auto-heal : ${AutoHeal_Last_Action}"
+    fi
     log INFO "Done."
 }
 
@@ -890,6 +1100,8 @@ Print_ALL_Status() {
  WireGuard\t: ${WireGuard_Status_en}
  IPv4 Network\t: ${WARP_IPv4_Status_en}
  IPv6 Network\t: ${WARP_IPv6_Status_en}
+ Last Handshake\t: $( [[ ${WireGuard_Handshake_Age} -gt 0 ]] && echo "${WireGuard_Handshake_Age}s ago" || echo "Unavailable" )
+ Auto-Heal\t: $( [[ ${AUTO_HEAL_ENABLED} = 1 ]] && echo "Enabled (cooldown ${AUTO_HEAL_COOLDOWN}s)" || echo "Disabled" )
  ----------------------------
 "
 }
@@ -901,13 +1113,26 @@ View_WireGuard_Profile() {
 }
 
 Check_WireGuard_Peer_Endpoint() {
-    if ping -c1 -W1 ${WireGuard_Peer_Endpoint_IP4} >/dev/null 2>&1; then
-        WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_IPv4}"
-    elif ping6 -c1 -W1 ${WireGuard_Peer_Endpoint_IP6} >/dev/null 2>&1; then
-        WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_IPv6}"
+    if [[ ${ENABLE_FAST_ENDPOINT} = 1 ]]; then
+        local ping_timeout=1
+        if ping -c1 -W${ping_timeout} ${WireGuard_Peer_Endpoint_IP4} >/dev/null 2>&1; then
+            WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_IPv4}"
+        elif ping6 -c1 -W${ping_timeout} ${WireGuard_Peer_Endpoint_IP6} >/dev/null 2>&1; then
+            WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_IPv6}"
+        else
+            WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_Domain}"
+            log WARN "Falling back to Cloudflare endpoint domain; direct IP test failed."
+        fi
     else
-        WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_Domain}"
+        if ping -c1 -W1 ${WireGuard_Peer_Endpoint_IP4} >/dev/null 2>&1; then
+            WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_IPv4}"
+        elif ping6 -c1 -W1 ${WireGuard_Peer_Endpoint_IP6} >/dev/null 2>&1; then
+            WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_IPv6}"
+        else
+            WireGuard_Peer_Endpoint="${WireGuard_Peer_Endpoint_Domain}"
+        fi
     fi
+    LastKnown_Peer_Endpoint="${WireGuard_Peer_Endpoint}"
 }
 
 Set_WARP_IPv4() {
@@ -1029,7 +1254,7 @@ ${Menu_Title}
         ;;
     *)
         log ERROR "无效输入！"
-        sleep 2s
+        sleep 1
         Menu_WARP_Client
         ;;
     esac
@@ -1072,7 +1297,7 @@ ${Menu_Title}
         ;;
     *)
         log ERROR "无效输入！"
-        sleep 2s
+        sleep 1
         Menu_Other
         ;;
     esac
@@ -1134,7 +1359,7 @@ ${Menu_Title}
         ;;
     *)
         log ERROR "无效输入！"
-        sleep 2s
+        sleep 1
         Start_Menu
         ;;
     esac
@@ -1160,6 +1385,9 @@ SUBCOMMANDS:
     wgx             Configuration WARP Non-Global Network (with WireGuard), set fwmark or interface IP Address to use the WARP network
     rwg             Restart WARP WireGuard service
     dwg             Disable WARP WireGuard service
+    autoheal-task   Run a single auto-heal cycle (for systemd timer)
+    autoheal-install    Install systemd timer to auto-heal WireGuard
+    autoheal-uninstall  Remove systemd auto-heal timer
     status          Prints status information
     version         Prints version information
     help            Prints this message or the help of the given subcommand(s)
@@ -1217,6 +1445,15 @@ if [ $# -ge 1 ]; then
         ;;
     dwg)
         Disable_WireGuard
+        ;;
+    autoheal-task)
+        AutoHeal_Task
+        ;;
+    autoheal-install)
+        Install_AutoHeal_Service
+        ;;
+    autoheal-uninstall)
+        Uninstall_AutoHeal_Service
         ;;
     status)
         Print_ALL_Status

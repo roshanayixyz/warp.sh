@@ -12,6 +12,9 @@ A Bash script that automatically installs and configures CloudFlare WARP in Linu
 - Configuration WARP IPv4 Network interface (WireGuard Mode)
 - Configuration WARP IPv6 Network interface (WireGuard Mode)
 - Configuration WARP Dual Stack Network interface (WireGuard Mode)
+- Optional performance toggles (network cache / MTU probe) with safe fallbacks
+- Built-in health monitor that can automatically restart WARP/WireGuard
+- Systemd timer integration for hands-off auto-heal
 - ...
 
 ## Requirements
@@ -63,11 +66,49 @@ wgd             Configuration WARP Dual Stack Global Network (with WireGuard), a
 wgx             Configuration WARP Non-Global Network (with WireGuard), set fwmark or interface IP Address to use the WARP network
 rwg             Restart WARP WireGuard service
 dwg             Disable WARP WireGuard service
+autoheal-task   Run a single auto-heal cycle (used by the timer)
+autoheal-install    Install the systemd timer that runs auto-heal every few minutes
+autoheal-uninstall  Remove the systemd timer
 status          Prints status information
 version         Prints version information
 help            Prints this message or the help of the given subcommand(s)
 menu            Chinese special features menu
 ```
+
+### Health monitoring & auto-heal
+
+- By default the script keeps tracking the latest WireGuard handshake age, MTU, endpoint and route snapshot.  
+- When `AUTO_HEAL_ENABLED=1`, every status check (or the optional systemd timer) automatically restarts `wg-quick@wgcf` if:
+  - No handshake has been observed for `AUTO_HEAL_HANDSHAKE_TIMEOUT` seconds (default 300s)
+  - A simple connectivity probe to `AUTO_HEAL_ROUTE_TARGET` (default `1.1.1.1`) fails
+- The timer interval can be controlled via `AUTO_HEAL_TIMER_INTERVAL` (default `15min`).
+
+To keep the tunnel healthy without manual intervention:
+
+```bash
+# run from the directory that contains warp.sh
+sudo bash warp.sh autoheal-install
+# systemd now runs `warp.sh autoheal-task` every AUTO_HEAL_TIMER_INTERVAL
+
+# to remove it later
+sudo bash warp.sh autoheal-uninstall
+```
+
+### Environment toggles
+
+All toggles can be provided as environment variables before invoking the script or by editing `/etc/default/warp-autoheal` after installing the timer.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `ENABLE_NETCACHE` | `0` | When `1`, avoid stopping WireGuard for every connectivity probe (faster but newer behavior). |
+| `ENABLE_FAST_MTU` | `0` | When `1`, use binary-search MTU probing; otherwise use the original step-down loop. |
+| `ENABLE_FAST_ENDPOINT` | `0` | When `1`, use faster endpoint detection with tighter timeouts. |
+| `AUTO_HEAL_ENABLED` | `1` | Toggle the auto-heal logic globally. |
+| `AUTO_HEAL_HANDSHAKE_TIMEOUT` | `300` | Seconds before a stale handshake triggers a restart. |
+| `AUTO_HEAL_ROUTE_TARGET` | `1.1.1.1` | Target IP used for connectivity checks. |
+| `AUTO_HEAL_COOLDOWN` | `60` | Minimum seconds between auto-heal attempts. |
+| `AUTO_HEAL_TIMER_INTERVAL` | `15min` | systemd timer frequency (when installed). |
+| `LOG_WITH_TIMESTAMP` | `1` | Prefix log lines with timestamps to simplify troubleshooting. |
 
 ### Example
 
