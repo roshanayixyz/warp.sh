@@ -1177,17 +1177,21 @@ View_WireGuard_Profile() {
 Resolve_Endpoint_Dynamic() {
     local resolved_ip4 resolved_ip6
     if command -v dig &>/dev/null; then
-        resolved_ip4=$(dig +short A engage.cloudflareclient.com 2>/dev/null | head -1)
-        resolved_ip6=$(dig +short AAAA engage.cloudflareclient.com 2>/dev/null | head -1)
+        resolved_ip4=$(dig +short +timeout=3 A engage.cloudflareclient.com 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+        resolved_ip6=$(dig +short +timeout=3 AAAA engage.cloudflareclient.com 2>/dev/null | grep -E '^[0-9a-f:]+$' | head -1)
     elif command -v nslookup &>/dev/null; then
-        resolved_ip4=$(nslookup engage.cloudflareclient.com 2>/dev/null | awk '/^Address: / {print $2}' | head -1)
+        resolved_ip4=$(nslookup -timeout=3 engage.cloudflareclient.com 2>/dev/null | awk '/^Address: / {print $2}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
     fi
-    if [[ -n ${resolved_ip4} && ${resolved_ip4} != ${WireGuard_Peer_Endpoint_IP4} ]]; then
+    if [[ -z ${resolved_ip4} && -z ${resolved_ip6} ]]; then
+        log WARN "DNS resolution failed. Using hardcoded Cloudflare endpoint IPs."
+        return
+    fi
+    if [[ -n ${resolved_ip4} && ${resolved_ip4} != "${WireGuard_Peer_Endpoint_IP4}" ]]; then
         log WARN "Cloudflare endpoint IP changed! Hardcoded: ${WireGuard_Peer_Endpoint_IP4} -> Resolved: ${resolved_ip4}"
         WireGuard_Peer_Endpoint_IP4="${resolved_ip4}"
         WireGuard_Peer_Endpoint_IPv4="${resolved_ip4}:2408"
     fi
-    if [[ -n ${resolved_ip6} && ${resolved_ip6} != ${WireGuard_Peer_Endpoint_IP6} ]]; then
+    if [[ -n ${resolved_ip6} && ${resolved_ip6} != "${WireGuard_Peer_Endpoint_IP6}" ]]; then
         log WARN "Cloudflare IPv6 endpoint changed! Hardcoded: ${WireGuard_Peer_Endpoint_IP6} -> Resolved: ${resolved_ip6}"
         WireGuard_Peer_Endpoint_IP6="${resolved_ip6}"
         WireGuard_Peer_Endpoint_IPv6="[${resolved_ip6}]:2408"
