@@ -110,16 +110,16 @@ TestIPv4_2='9.9.9.9'
 TestIPv6_1='2606:4700:4700::1001'
 TestIPv6_2='2620:fe::fe'
 CF_Trace_URL='https://www.cloudflare.com/cdn-cgi/trace'
-Network_Status_Cache_TTL=5
+Network_Status_Cache_TTL=15
 Network_Status_Last_Check=0
-ENABLE_NETCACHE=${ENABLE_NETCACHE:-0}
-ENABLE_FAST_MTU=${ENABLE_FAST_MTU:-0}
-ENABLE_FAST_ENDPOINT=${ENABLE_FAST_ENDPOINT:-0}
+ENABLE_NETCACHE=${ENABLE_NETCACHE:-1}
+ENABLE_FAST_MTU=${ENABLE_FAST_MTU:-1}
+ENABLE_FAST_ENDPOINT=${ENABLE_FAST_ENDPOINT:-1}
 AUTO_HEAL_ENABLED=${AUTO_HEAL_ENABLED:-1}
-AUTO_HEAL_HANDSHAKE_TIMEOUT=${AUTO_HEAL_HANDSHAKE_TIMEOUT:-300}
+AUTO_HEAL_HANDSHAKE_TIMEOUT=${AUTO_HEAL_HANDSHAKE_TIMEOUT:-600}
 AUTO_HEAL_ROUTE_TARGET=${AUTO_HEAL_ROUTE_TARGET:-1.1.1.1}
-AUTO_HEAL_COOLDOWN=${AUTO_HEAL_COOLDOWN:-60}
-AUTO_HEAL_TIMER_INTERVAL=${AUTO_HEAL_TIMER_INTERVAL:-15min}
+AUTO_HEAL_COOLDOWN=${AUTO_HEAL_COOLDOWN:-120}
+AUTO_HEAL_TIMER_INTERVAL=${AUTO_HEAL_TIMER_INTERVAL:-30min}
 AUTO_HEAL_SERVICE_NAME='warp-autoheal.service'
 AUTO_HEAL_TIMER_NAME='warp-autoheal.timer'
 AUTO_HEAL_ENV_FILE='/etc/default/warp-autoheal'
@@ -128,6 +128,9 @@ AUTO_HEAL_TIMER_PATH="/etc/systemd/system/${AUTO_HEAL_TIMER_NAME}"
 AutoHeal_Last_Run=0
 AutoHeal_Last_Action='never'
 LOG_WITH_TIMESTAMP=${LOG_WITH_TIMESTAMP:-1}
+REGISTER_MAX_RETRIES=${REGISTER_MAX_RETRIES:-5}
+REGISTER_RETRY_DELAY=${REGISTER_RETRY_DELAY:-3}
+WGCF_PROFILE_BACKUP='/etc/warp/wgcf-profile.conf.bak'
 LastKnown_MTU=""
 LastKnown_Peer_Endpoint=""
 LastKnown_RouteSnapshot=""
@@ -219,6 +222,7 @@ Check_WARP_Client() {
 
 Install_WARP_Client() {
     Print_System_Info
+    Quick_Optimize
     log INFO "Installing Cloudflare WARP Client..."
     if [[ ${SysInfo_Arch} != x86_64 ]]; then
         log ERROR "This CPU architecture is not supported: ${SysInfo_Arch}"
@@ -272,6 +276,7 @@ Uninstall_WARP_Client() {
 }
 
 Restart_WARP_Client() {
+    Quick_Optimize
     log INFO "Restarting Cloudflare WARP Client..."
     systemctl restart warp-svc
     Check_WARP_Client
@@ -290,8 +295,22 @@ Init_WARP_Client() {
         Install_WARP_Client
     fi
     if [[ $(warp-cli --accept-tos account) = *Missing* ]]; then
-        log INFO "Cloudflare WARP Account Registration in progress..."
-        warp-cli --accept-tos register
+        local attempt=0
+        while [[ $(warp-cli --accept-tos account 2>/dev/null) = *Missing* ]]; do
+            attempt=$((attempt + 1))
+            if [[ ${attempt} -gt ${REGISTER_MAX_RETRIES} ]]; then
+                log ERROR "WARP client registration failed after ${REGISTER_MAX_RETRIES} attempts."
+                log ERROR "Cloudflare may be blocking registrations or the service is down."
+                exit 1
+            fi
+            log INFO "Cloudflare WARP Account Registration (attempt ${attempt}/${REGISTER_MAX_RETRIES})..."
+            warp-cli --accept-tos register 2>/dev/null
+            if [[ $(warp-cli --accept-tos account 2>/dev/null) = *Missing* ]]; then
+                local delay=$((REGISTER_RETRY_DELAY * attempt))
+                log WARN "Registration failed. Retrying in ${delay}s..."
+                sleep ${delay}
+            fi
+        done
     fi
 }
 
@@ -339,19 +358,46 @@ Uninstall_wgcf() {
 }
 
 Register_WARP_Account() {
+    local attempt=0
     while [[ ! -f wgcf-account.toml ]]; do
+        attempt=$((attempt + 1))
+        if [[ ${attempt} -gt ${REGISTER_MAX_RETRIES} ]]; then
+            log ERROR "WARP account registration failed after ${REGISTER_MAX_RETRIES} attempts."
+            log ERROR "Cloudflare may be blocking registrations. Try again later or use an existing profile."
+            log ERROR "If you have a backup profile, place it at: ${WGCF_ProfilePath}"
+            return 1
+        fi
         Install_wgcf
-        log INFO "Cloudflare WARP Account registration in progress..."
-        yes | wgcf register
-        sleep 1
+        log INFO "Cloudflare WARP Account registration (attempt ${attempt}/${REGISTER_MAX_RETRIES})..."
+        yes | wgcf register 2>/dev/null
+        if [[ ! -f wgcf-account.toml ]]; then
+            local delay=$((REGISTER_RETRY_DELAY * attempt))
+            log WARN "Registration failed. Retrying in ${delay}s..."
+            sleep ${delay}
+        fi
     done
 }
 
 Generate_WGCF_Profile() {
+    local attempt=0
     while [[ ! -f ${WGCF_Profile} ]]; do
-        Register_WARP_Account
-        log INFO "WARP WireGuard profile (wgcf-profile.conf) generation in progress..."
-        wgcf generate
+        attempt=$((attempt + 1))
+        if [[ ${attempt} -gt ${REGISTER_MAX_RETRIES} ]]; then
+            log ERROR "Profile generation failed after ${REGISTER_MAX_RETRIES} attempts."
+            if [[ -f ${WGCF_PROFILE_BACKUP} ]]; then
+                log WARN "Restoring from backup profile..."
+                cp -f ${WGCF_PROFILE_BACKUP} ${WGCF_ProfilePath}
+                return 0
+            fi
+            log ERROR "No backup profile found. Cannot continue."
+            return 1
+        fi
+        Register_WARP_Account || return 1
+        log INFO "WARP WireGuard profile generation (attempt ${attempt}/${REGISTER_MAX_RETRIES})..."
+        wgcf generate 2>/dev/null
+        if [[ ! -f ${WGCF_Profile} ]]; then
+            sleep ${REGISTER_RETRY_DELAY}
+        fi
     done
     Uninstall_wgcf
 }
@@ -359,6 +405,10 @@ Generate_WGCF_Profile() {
 Backup_WGCF_Profile() {
     mkdir -p ${WGCF_ProfileDir}
     mv -f wgcf* ${WGCF_ProfileDir}
+    if [[ -f ${WGCF_ProfilePath} ]]; then
+        cp -f ${WGCF_ProfilePath} ${WGCF_PROFILE_BACKUP}
+        log INFO "Profile backed up to ${WGCF_PROFILE_BACKUP}"
+    fi
 }
 
 Read_WGCF_Profile() {
@@ -375,8 +425,16 @@ Load_WGCF_Profile() {
         Read_WGCF_Profile
     elif [[ -f ${WGCF_ProfilePath} ]]; then
         Read_WGCF_Profile
+    elif [[ -f ${WGCF_PROFILE_BACKUP} ]]; then
+        log WARN "No active profile found. Restoring from backup..."
+        cp -f ${WGCF_PROFILE_BACKUP} ${WGCF_ProfilePath}
+        Read_WGCF_Profile
     else
         Generate_WGCF_Profile
+        if [[ $? -ne 0 ]]; then
+            log ERROR "Failed to generate WARP profile. Cannot continue."
+            exit 1
+        fi
         Backup_WGCF_Profile
         Read_WGCF_Profile
     fi
@@ -479,6 +537,7 @@ Install_WireGuard() {
 }
 
 Start_WireGuard() {
+    Quick_Optimize
     Check_WARP_Client
     log INFO "Starting WireGuard..."
     if [[ ${WARP_Client_Status} = active ]]; then
@@ -499,6 +558,7 @@ Start_WireGuard() {
 }
 
 Restart_WireGuard() {
+    Quick_Optimize
     Check_WARP_Client
     log INFO "Restarting WireGuard..."
     if [[ ${WARP_Client_Status} = active ]]; then
@@ -823,7 +883,7 @@ Check_WARP_Proxy_Status() {
     Check_WARP_Client
     if [[ ${WARP_Client_Status} = active ]]; then
         Get_WARP_Proxy_Port
-        WARP_Proxy_Status=$(curl -sx "socks5h://127.0.0.1:${WARP_Proxy_Port}" ${CF_Trace_URL} --connect-timeout 2 | grep warp | cut -d= -f2)
+        WARP_Proxy_Status=$(curl -sx "socks5h://127.0.0.1:${WARP_Proxy_Port}" ${CF_Trace_URL} --connect-timeout 1 | grep warp | cut -d= -f2)
     else
         unset WARP_Proxy_Status
     fi
@@ -860,7 +920,7 @@ Check_WireGuard_Status() {
 Check_WARP_WireGuard_Status() {
     Check_Network_Status_IPv4
     if [[ ${IPv4Status} = on ]]; then
-        WARP_IPv4_Status=$(curl -s4 ${CF_Trace_URL} --connect-timeout 2 | grep warp | cut -d= -f2)
+        WARP_IPv4_Status=$(curl -s4 ${CF_Trace_URL} --connect-timeout 1 | grep warp | cut -d= -f2)
     else
         unset WARP_IPv4_Status
     fi
@@ -890,7 +950,7 @@ Check_WARP_WireGuard_Status() {
     esac
     Check_Network_Status_IPv6
     if [[ ${IPv6Status} = on ]]; then
-        WARP_IPv6_Status=$(curl -s6 ${CF_Trace_URL} --connect-timeout 2 | grep warp | cut -d= -f2)
+        WARP_IPv6_Status=$(curl -s6 ${CF_Trace_URL} --connect-timeout 1 | grep warp | cut -d= -f2)
     else
         unset WARP_IPv6_Status
     fi
@@ -1012,6 +1072,8 @@ Type=simple
 EnvironmentFile=-${AUTO_HEAL_ENV_FILE}
 ExecStart=/bin/bash -c "\$WARP_SCRIPT_PATH autoheal-task"
 Nice=10
+MemoryMax=64M
+CPUQuota=50%
 EOF
     cat <<EOF >${AUTO_HEAL_TIMER_PATH}
 [Unit]
@@ -1112,7 +1174,28 @@ View_WireGuard_Profile() {
     Print_Delimiter
 }
 
+Resolve_Endpoint_Dynamic() {
+    local resolved_ip4 resolved_ip6
+    if command -v dig &>/dev/null; then
+        resolved_ip4=$(dig +short A engage.cloudflareclient.com 2>/dev/null | head -1)
+        resolved_ip6=$(dig +short AAAA engage.cloudflareclient.com 2>/dev/null | head -1)
+    elif command -v nslookup &>/dev/null; then
+        resolved_ip4=$(nslookup engage.cloudflareclient.com 2>/dev/null | awk '/^Address: / {print $2}' | head -1)
+    fi
+    if [[ -n ${resolved_ip4} && ${resolved_ip4} != ${WireGuard_Peer_Endpoint_IP4} ]]; then
+        log WARN "Cloudflare endpoint IP changed! Hardcoded: ${WireGuard_Peer_Endpoint_IP4} -> Resolved: ${resolved_ip4}"
+        WireGuard_Peer_Endpoint_IP4="${resolved_ip4}"
+        WireGuard_Peer_Endpoint_IPv4="${resolved_ip4}:2408"
+    fi
+    if [[ -n ${resolved_ip6} && ${resolved_ip6} != ${WireGuard_Peer_Endpoint_IP6} ]]; then
+        log WARN "Cloudflare IPv6 endpoint changed! Hardcoded: ${WireGuard_Peer_Endpoint_IP6} -> Resolved: ${resolved_ip6}"
+        WireGuard_Peer_Endpoint_IP6="${resolved_ip6}"
+        WireGuard_Peer_Endpoint_IPv6="[${resolved_ip6}]:2408"
+    fi
+}
+
 Check_WireGuard_Peer_Endpoint() {
+    Resolve_Endpoint_Dynamic
     if [[ ${ENABLE_FAST_ENDPOINT} = 1 ]]; then
         local ping_timeout=1
         if ping -c1 -W${ping_timeout} ${WireGuard_Peer_Endpoint_IP4} >/dev/null 2>&1; then
@@ -1328,6 +1411,8 @@ ${Menu_Title}
  ${FontColor_Green_Bold}6${FontColor_Suffix}. 自动配置 WARP WireGuard IPv6 网络
  ${FontColor_Green_Bold}7${FontColor_Suffix}. 自动配置 WARP WireGuard 双栈全局网络
  ${FontColor_Green_Bold}8${FontColor_Suffix}. 管理 WARP WireGuard 网络
+ -
+ ${FontColor_Green_Bold}9${FontColor_Suffix}. 系统优化 (清理内存/创建交换/内核调优)
 "
     unset MenuNumber
     read -p "请输入选项: " MenuNumber
@@ -1357,12 +1442,112 @@ ${Menu_Title}
     8)
         Menu_WARP_WireGuard
         ;;
+    9)
+        Optimize_System
+        ;;
     *)
         log ERROR "无效输入！"
         sleep 1
         Start_Menu
         ;;
     esac
+}
+
+Quick_Optimize() {
+    local mem_before=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    sync 2>/dev/null
+    echo 3 >/proc/sys/vm/drop_caches 2>/dev/null
+    local zombies=$(ps -eo stat,ppid | awk '/^Z/ {print $2}' 2>/dev/null)
+    if [[ -n ${zombies} ]]; then
+        for ppid in ${zombies}; do
+            kill -9 "${ppid}" 2>/dev/null
+        done
+    fi
+    local mem_after=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local freed=$(( (mem_after - mem_before) / 1024 ))
+    if [[ ${freed} -gt 0 ]]; then
+        log INFO "Quick optimize: freed ${freed}MB RAM"
+    else
+        log INFO "Quick optimize: caches cleared"
+    fi
+}
+
+Optimize_System() {
+    Print_Delimiter
+    log INFO "System Optimizer for Low-Resource Servers"
+    Print_Delimiter
+
+    # --- RAM Cleanup ---
+    log INFO "Step 1/4: Cleaning RAM..."
+    Quick_Optimize
+    if command -v journalctl &>/dev/null; then
+        journalctl --vacuum-size=16M 2>/dev/null
+        log INFO "Systemd journal trimmed to 16MB max"
+    fi
+    find /tmp -type f -atime +7 -delete 2>/dev/null
+    log INFO "Cleared old /tmp files"
+
+    # --- Swap Management ---
+    log INFO "Step 2/4: Checking swap..."
+    local swap_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    if [[ ${swap_total} -le 0 ]]; then
+        log WARN "No swap detected! Creating 512MB swap file..."
+        if dd if=/dev/zero of=/swapfile bs=1M count=512 status=progress 2>/dev/null; then
+            chmod 600 /swapfile
+            mkswap /swapfile >/dev/null 2>&1
+            swapon /swapfile 2>/dev/null
+            if ! grep -q '/swapfile' /etc/fstab 2>/dev/null; then
+                echo '/swapfile none swap sw 0 0' >>/etc/fstab
+            fi
+            log INFO "512MB swap file created and enabled"
+        else
+            log ERROR "Failed to create swap file (disk full?)"
+        fi
+    else
+        local swap_mb=$((swap_total / 1024))
+        log INFO "Swap already exists: ${swap_mb}MB"
+    fi
+
+    # --- Kernel Tuning ---
+    log INFO "Step 3/4: Tuning kernel for low-RAM..."
+    local sysctl_file='/etc/sysctl.d/99-warp-optimize.conf'
+    cat <<'SYSCTL' >${sysctl_file}
+# WARP low-resource optimization
+vm.swappiness = 60
+vm.vfs_cache_pressure = 200
+vm.min_free_kbytes = 16384
+vm.overcommit_memory = 1
+net.core.somaxconn = 512
+SYSCTL
+    sysctl -p ${sysctl_file} >/dev/null 2>&1
+    log INFO "Kernel parameters applied (${sysctl_file})"
+
+    # --- Kill Bloat Services ---
+    log INFO "Step 4/4: Disabling unnecessary services..."
+    local bloat_services=("snapd" "ModemManager" "accounts-daemon" "unattended-upgrades")
+    local disabled_count=0
+    for svc in "${bloat_services[@]}"; do
+        if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+            systemctl disable --now "${svc}" 2>/dev/null
+            log INFO "  Disabled: ${svc}"
+            disabled_count=$((disabled_count + 1))
+        fi
+    done
+    if [[ ${disabled_count} -eq 0 ]]; then
+        log INFO "  No bloat services found to disable"
+    fi
+
+    # --- Summary ---
+    Print_Delimiter
+    local mem_avail=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    local swap_now=$(awk '/SwapTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    log INFO "Optimization Complete!"
+    log INFO "  RAM: $((mem_avail / 1024))MB available / $((mem_total / 1024))MB total"
+    log INFO "  Swap: $((swap_now / 1024))MB"
+    log INFO "  Kernel: tuned for low-memory"
+    log INFO "  Services: ${disabled_count} bloat service(s) disabled"
+    Print_Delimiter
 }
 
 Print_Usage() {
@@ -1388,6 +1573,7 @@ SUBCOMMANDS:
     autoheal-task   Run a single auto-heal cycle (for systemd timer)
     autoheal-install    Install systemd timer to auto-heal WireGuard
     autoheal-uninstall  Remove systemd auto-heal timer
+    optimize        Optimize system for low-resource servers (RAM cleanup, swap, kernel tuning)
     status          Prints status information
     version         Prints version information
     help            Prints this message or the help of the given subcommand(s)
@@ -1454,6 +1640,9 @@ if [ $# -ge 1 ]; then
         ;;
     autoheal-uninstall)
         Uninstall_AutoHeal_Service
+        ;;
+    optimize | opt)
+        Optimize_System
         ;;
     status)
         Print_ALL_Status
